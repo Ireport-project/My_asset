@@ -1,0 +1,23 @@
+# streamlit-authenticator 설정 (main.py와 같은 폴더)
+# 로그인 Username: dreamjim@naver.com
+# 비밀번호 변경 시: python hash_password_for_config.py
+
+credentials:
+  usernames:
+    dreamjim@naver.com:
+      email: dreamjim@naver.com
+      name: 관리자
+      password: "$2b$12$prEqo21vKqDwA14w3GEJj.IMhsv3JZ1ciNcyYME401XVmmRNUsR8O"
+    junyminy23@naver.com:
+      email: junyminy23@naver.com
+      name: 관리자
+      password: "$2b$12$prEqo21vKqDwA14w3GEJj.IMhsv3JZ1ciNcyYME401XVmmRNUsR8O"
+
+
+cookie:
+  name: asset_tracker_auth_cookie
+  key: 2ea315dc69c016acf5a591077bae9f2e01bf28832a7671111a2f854f8e22080b
+  expiry_days: 30
+
+preauthorized:
+  emails: []
