@@ -4,3 +4,4 @@ plotly>=5.22
 firebase-admin>=6.5
 streamlit-authenticator>=0.4.2
 PyYAML>=6.0
+tzdata>=2024.1
