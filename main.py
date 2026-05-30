@@ -75,15 +75,30 @@ def _to_kst_date(value: object) -> pd.Timestamp:
     return ts.normalize()
 
 
+def _epoch_ns(value: object) -> int:
+    """보간용 epoch 나노초. astype(int64) 환경 차이를 피한다."""
+    return int(_to_kst_date(value).value)
+
+
 def _parse_record_date(value: object) -> pd.Timestamp:
     """Firestore에서 읽은 날짜 값을 KST 기준 Timestamp로 변환한다."""
     if value is None:
         return pd.NaT
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return pd.NaT
+        if "T" in text:
+            return _to_kst_date(text)
+        return _to_kst_date(text[:10])
     if isinstance(value, datetime):
         return _to_kst_date(value)
     if isinstance(value, date) and not isinstance(value, datetime):
         return _to_kst_date(value.isoformat())
-    return _to_kst_date(value)
+    try:
+        return _to_kst_date(value)
+    except (TypeError, ValueError, pd.errors.OutOfBoundsDatetime):
+        return pd.NaT
 
 
 def format_default_amount(value: int) -> str:
@@ -170,6 +185,7 @@ def load_data() -> pd.DataFrame:
         df["date"] = pd.to_datetime(df["date"])
     else:
         df = df.dropna(subset=["date"])
+        df["date"] = df["date"].map(_to_kst_date)
         df = df.sort_values(["asset", "date"]).reset_index(drop=True)
     for col in ("payment", "refund"):
         if col in df.columns:
@@ -246,6 +262,7 @@ def build_summary(df: pd.DataFrame, selected_assets: list[str]) -> pd.DataFrame:
             columns=["date", "cum_payment", "current_refund", "profit", "rate"]
         )
 
+    filtered["date"] = filtered["date"].map(_to_kst_date)
     filtered = filtered.sort_values(["asset", "date"])
     all_dates = sorted(filtered["date"].unique())
 
@@ -323,10 +340,14 @@ def _interpolate_amounts(
         row = timeline.iloc[0]
         return float(row["cum_payment"]), float(row["current_refund"])
 
-    x = timeline["date"].astype(np.int64).to_numpy()
+    x = np.array([_epoch_ns(d) for d in timeline["date"]], dtype=np.int64)
     payment = timeline["cum_payment"].to_numpy(dtype=float)
     refund = timeline["current_refund"].to_numpy(dtype=float)
-    target_x = target.value
+    order = np.argsort(x)
+    x = x[order]
+    payment = payment[order]
+    refund = refund[order]
+    target_x = _epoch_ns(target)
     return (
         float(np.interp(target_x, x, payment)),
         float(np.interp(target_x, x, refund)),
@@ -360,9 +381,12 @@ def interpolated_at(series: pd.Series, target: pd.Timestamp) -> Optional[float]:
     if len(sorted_series) == 1:
         return float(sorted_series.iloc[0])
 
-    x = sorted_series.index.astype(np.int64).to_numpy()
-    y = sorted_series.to_numpy()
-    return float(np.interp(target.value, x, y))
+    x = np.array([_epoch_ns(d) for d in sorted_series.index], dtype=np.int64)
+    y = sorted_series.to_numpy(dtype=float)
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+    return float(np.interp(_epoch_ns(target), x, y))
 
 
 def profit_at_summary(summary: pd.DataFrame, target: pd.Timestamp) -> Optional[float]:
@@ -465,18 +489,32 @@ def build_yearly_summary(summary: pd.DataFrame) -> pd.DataFrame:
             ]
         )
 
-    payment_series = _value_series(summary, "cum_payment")
-    refund_series = _value_series(summary, "current_refund")
-    profit_series = _profit_series(summary)
-    first_year = int(payment_series.index.min().year)
-    last_year = int(payment_series.index.max().year)
+    timeline = _summary_timeline(summary)
+    if timeline.empty:
+        return pd.DataFrame(
+            columns=[
+                "year",
+                "cum_payment",
+                "current_refund",
+                "profit",
+                "rate",
+                "profit_yoy",
+                "rate_yoy",
+            ]
+        )
+
+    first_year = int(timeline["date"].iloc[0].year)
+    last_year = int(timeline["date"].iloc[-1].year)
 
     rows: list[dict[str, object]] = []
     for year in range(first_year, last_year + 1):
-        target = pd.Timestamp(year, 12, 31)
-        payment = interpolated_at(payment_series, target) or 0.0
-        refund = interpolated_at(refund_series, target) or 0.0
-        profit = interpolated_at(profit_series, target) or 0.0
+        target = _to_kst_date(pd.Timestamp(year, 12, 31))
+        amounts = _interpolate_amounts(timeline, target)
+        if amounts is None:
+            payment, refund = 0.0, 0.0
+        else:
+            payment, refund = amounts
+        profit = refund - payment
         rate = (profit / payment * 100) if payment > 0 else 0.0
         rows.append(
             {
