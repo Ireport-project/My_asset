@@ -67,6 +67,25 @@ def korea_today() -> date:
     return datetime.now(KOREA_TZ).date()
 
 
+def _to_kst_date(value: object) -> pd.Timestamp:
+    """Firestore/로컬 환경 차이를 줄이기 위해 KST 기준 날짜(00:00)로 통일."""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(KOREA_TZ).tz_localize(None)
+    return ts.normalize()
+
+
+def _parse_record_date(value: object) -> pd.Timestamp:
+    """Firestore에서 읽은 날짜 값을 KST 기준 Timestamp로 변환한다."""
+    if value is None:
+        return pd.NaT
+    if isinstance(value, datetime):
+        return _to_kst_date(value)
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return _to_kst_date(value.isoformat())
+    return _to_kst_date(value)
+
+
 def format_default_amount(value: int) -> str:
     """입력 필드 기본값용 금액 문자열. 0이면 빈 칸."""
     return f"{value:,}" if value > 0 else ""
@@ -139,7 +158,7 @@ def load_data() -> pd.DataFrame:
             continue
         rows.append(
             {
-                "date": d.get("date"),
+                "date": _parse_record_date(d.get("date")),
                 "asset": d.get("asset", ""),
                 "payment": d.get("payment", 0),
                 "refund": d.get("refund", 0),
@@ -150,9 +169,7 @@ def load_data() -> pd.DataFrame:
         df = pd.DataFrame(columns=COLUMNS)
         df["date"] = pd.to_datetime(df["date"])
     else:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"])
-        df["date"] = df["date"].map(_to_kst_date)
         df = df.sort_values(["asset", "date"]).reset_index(drop=True)
     for col in ("payment", "refund"):
         if col in df.columns:
@@ -282,12 +299,38 @@ def filter_summary_by_period(summary: pd.DataFrame, period_label: str) -> pd.Dat
     return filtered.reset_index(drop=True)
 
 
-def _to_kst_date(value: object) -> pd.Timestamp:
-    """Firestore/로컬 환경 차이를 줄이기 위해 KST 기준 날짜(00:00)로 통일."""
-    ts = pd.Timestamp(value)
-    if ts.tzinfo is not None:
-        ts = ts.tz_convert(KOREA_TZ).tz_localize(None)
-    return ts.normalize()
+def _summary_timeline(summary: pd.DataFrame) -> pd.DataFrame:
+    """수익 보간용 날짜별 누적 납입금·환급금 시계열."""
+    timeline = summary.copy()
+    timeline["date"] = pd.to_datetime(timeline["date"], errors="coerce").map(_to_kst_date)
+    timeline = timeline.dropna(subset=["date"]).sort_values("date")
+    timeline = timeline.drop_duplicates(subset=["date"], keep="last")
+    for col in ("cum_payment", "current_refund"):
+        timeline[col] = pd.to_numeric(timeline[col], errors="coerce")
+    timeline = timeline.dropna(subset=["cum_payment", "current_refund"])
+    return timeline.reset_index(drop=True)
+
+
+def _interpolate_amounts(
+    timeline: pd.DataFrame, target: pd.Timestamp
+) -> Optional[tuple[float, float]]:
+    """기준일의 (누적 납입금, 누적 환급금) 보간값."""
+    if timeline.empty:
+        return None
+
+    target = _to_kst_date(target)
+    if len(timeline) == 1:
+        row = timeline.iloc[0]
+        return float(row["cum_payment"]), float(row["current_refund"])
+
+    x = timeline["date"].astype(np.int64).to_numpy()
+    payment = timeline["cum_payment"].to_numpy(dtype=float)
+    refund = timeline["current_refund"].to_numpy(dtype=float)
+    target_x = target.value
+    return (
+        float(np.interp(target_x, x, payment)),
+        float(np.interp(target_x, x, refund)),
+    )
 
 
 def _value_series(summary: pd.DataFrame, column: str) -> pd.Series:
@@ -324,10 +367,10 @@ def interpolated_at(series: pd.Series, target: pd.Timestamp) -> Optional[float]:
 
 def profit_at_summary(summary: pd.DataFrame, target: pd.Timestamp) -> Optional[float]:
     """기준일 누적 환급금·납입금 보간값으로 수익을 계산한다."""
-    payment = interpolated_at(_value_series(summary, "cum_payment"), target)
-    refund = interpolated_at(_value_series(summary, "current_refund"), target)
-    if payment is None or refund is None:
+    amounts = _interpolate_amounts(_summary_timeline(summary), target)
+    if amounts is None:
         return None
+    payment, refund = amounts
     return refund - payment
 
 
@@ -337,7 +380,7 @@ def interpolated_profit_at(profit_series: pd.Series, target: pd.Timestamp) -> Op
 
 
 def compute_profit_changes(summary: pd.DataFrame) -> dict[str, Optional[float]]:
-    """한국 시간 오늘 기준 전일/전월/1년전/년초 수익 증감액 (보간값)."""
+    """최신 기록일 기준 전일/전월/1년전/년초 수익 증감액 (보간값)."""
     if summary.empty:
         return {
             "전일 대비": None,
@@ -346,8 +389,17 @@ def compute_profit_changes(summary: pd.DataFrame) -> dict[str, Optional[float]]:
             "년초 대비": None,
         }
 
-    as_of = _to_kst_date(korea_today())
-    current_profit = profit_at_summary(summary, as_of)
+    timeline = _summary_timeline(summary)
+    if timeline.empty:
+        return {
+            "전일 대비": None,
+            "전월 대비": None,
+            "1년전 대비": None,
+            "년초 대비": None,
+        }
+
+    eval_date = _to_kst_date(timeline["date"].iloc[-1])
+    current_profit = profit_at_summary(summary, eval_date)
     if current_profit is None:
         return {
             "전일 대비": None,
@@ -363,10 +415,10 @@ def compute_profit_changes(summary: pd.DataFrame) -> dict[str, Optional[float]]:
         return current_profit - past_profit
 
     return {
-        "전일 대비": change_since(as_of - pd.Timedelta(days=1)),
-        "전월 대비": change_since(as_of - pd.DateOffset(months=1)),
-        "1년전 대비": change_since(as_of - pd.DateOffset(years=1)),
-        "년초 대비": change_since(pd.Timestamp(as_of.year, 1, 1)),
+        "전일 대비": change_since(eval_date - pd.Timedelta(days=1)),
+        "전월 대비": change_since(eval_date - pd.DateOffset(months=1)),
+        "1년전 대비": change_since(eval_date - pd.DateOffset(years=1)),
+        "년초 대비": change_since(pd.Timestamp(eval_date.year, 1, 1)),
     }
 
 
